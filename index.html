@@ -66,6 +66,7 @@ h2 { font-size: 1rem; margin: 0 0 12px; }
 .ghost:hover { background: var(--surface-2); }
 
 .notice { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; font-size: .88rem; }
+.notice .link-btn { text-decoration: underline; color: var(--accent); }
 
 /* 요약 */
 .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
@@ -212,7 +213,12 @@ input[type=text], input[type=date], input[type=search] {
 </head>
 <body>
 <div class="app">
-  <div id="notice" class="notice" role="status" hidden>이 브라우저에서는 저장소를 쓸 수 없어요. 지금 입력한 내용은 페이지를 닫으면 사라지니, 필요하면 “데이터 관리”에서 백업해 두세요.</div>
+  <div id="notice" class="notice" role="status" hidden><span id="noticeMsg"></span> <button class="link-btn" id="noticeRetry" type="button">다시 시도</button></div>
+
+  <div id="main">
+  <div id="legacy" class="notice" hidden>이 브라우저에 저장돼 있던 예전 기록 <b id="legacyN"></b>건이 있어요. 서버로 옮기면 어느 기기에서든 볼 수 있고, 옮긴 뒤 이 브라우저의 예전 기록은 지워져요.
+    <button class="ghost" id="legacyMove" type="button">서버로 옮기기</button>
+    <button class="link-btn" id="legacyLater" type="button">나중에</button></div>
 
   <header class="top">
     <h1>가계부</h1>
@@ -280,20 +286,27 @@ input[type=text], input[type=date], input[type=search] {
       <button class="ghost" id="exportCsv" type="button">엑셀용 CSV 내보내기</button>
       <button class="ghost" id="exportJson" type="button">백업 저장 (JSON)</button>
       <button class="ghost" id="importJson" type="button">백업 불러오기</button>
+      <button class="ghost danger" id="wipeSample" type="button" hidden>샘플 데이터 지우기</button>
       <button class="ghost danger" id="wipe" type="button">전체 삭제</button>
       <input type="file" id="file" accept="application/json,.json" hidden>
     </div>
-    <p class="hint">데이터는 이 브라우저(이 기기)에만 저장돼요. 브라우저 기록을 지우면 함께 사라지니 가끔 백업해 두세요.</p>
+    <p class="hint">기록은 서버(Supabase)에 저장돼서 어느 기기에서든 같은 내용이 보여요. 로그인이 없어서 이 페이지 주소를 아는 사람은 누구나 기록을 보고 고칠 수 있으니, 주소는 나눠 주지 마세요. 백업 파일은 따로 받아 둘 수도 있어요.</p>
   </details>
+  </div>
 </div>
 
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.116.0/dist/umd/supabase.js" integrity="sha384-iLddHTLokph6Omwoyid4XKxHaWa6w41BnoEj0q5oOrzmYPpHIKt1wyjReA7s//pP" crossorigin="anonymous"></script>
 <script>
 (() => {
 'use strict';
 
-const KEY = 'gagyebu.v1';
+const SUPABASE_URL = 'https://hnqgmmqfrelxevhtuuqb.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_XmUw-9WO8FuKm7ACT6vRdw_ic3vfuhA';   // 공개용 키 (비밀 키 아님). 로그인이 없어서 이 키로 DB 정책이 허용하는 만큼 누구나 접근할 수 있음
+const TABLE = 'transactions';
+const COLS = 'id,seq,date,type,cat,memo,amount,sample';
+const LEGACY_KEY = 'gagyebu.v1';   // 예전 버전이 이 브라우저에 저장하던 키 (서버로 옮길 때만 읽음)
 const CATS = {
   expense: [['식비', '#e8743b'], ['교통', '#3b82c4'], ['주거·통신', '#7a6ad8'], ['쇼핑', '#d9569b'], ['문화·여가', '#2fa39a'],
             ['의료·건강', '#5aa845'], ['교육', '#c9a227'], ['경조사', '#a0674b'], ['기타', '#8a8a8a']],
@@ -367,7 +380,6 @@ const pad = (n) => String(n).padStart(2, '0');
 const iso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const num = (n) => n.toLocaleString('ko-KR');
 const won = (n) => num(n) + '원';
-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const colorOf = (type, cat) => (CATS[type].find((c) => c[0] === cat) || [0, '#8a8a8a'])[1];
 
 function el(tag, props = {}, ...kids) {
@@ -389,44 +401,99 @@ function icon(type, cat, size = '') {
   return n;
 }
 
-/* ---------- 저장소 ---------- */
-let storageOk = true;
+/* ---------- 서버(Supabase) ---------- */
+// 로그인이 없는 앱이라 세션을 저장·갱신할 필요가 없음
+const sb = window.supabase && window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+});
+const db = () => sb.from(TABLE);
 
+// 42501: 서버가 접근을 막음 (테이블 접근 설정이 아직 안 됐을 때)
+const DENIED = '서버가 이 앱의 접근을 막고 있어요. Supabase 테이블 접근 설정이 아직 안 된 것 같아요. (README의 “DB 설정” 참고)';
+const denied = (err) => !!err && err.code === '42501';
+
+const fromRow = (r) => ({ id: r.id, seq: Number(r.seq), date: r.date, type: r.type, category: r.cat, memo: r.memo, amount: Number(r.amount), sample: r.sample });
+const toRow = (t) => ({ date: t.date, type: t.type, cat: t.category, amount: t.amount });
+
+// 서버가 한 번에 주는 행 수에 제한(기본 1000)이 있어서, 끝날 때까지 나눠서 받음. 쿼리는 순서가 고정돼 있어야 함
+async function fetchAll(build) {
+  const out = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await build().range(from, from + 999);
+    if (error) throw error;
+    out.push(...data);
+    if (data.length < 1000) return out.map(fromRow);
+  }
+}
+async function count(where) {
+  const q = db().select('id', { count: 'exact', head: true });
+  const { count: n, error } = await (where ? where(q) : q);
+  if (error) throw error;
+  return n || 0;
+}
+
+/* 가져온 백업·예전 기록을 검사하고 다듬기 */
+function validDate(s) {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const [y, m, d] = s.split('-').map(Number);
+  const dt = new Date(y, m - 1, d);
+  return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
+}
 function isValid(t) {
   return t && typeof t === 'object'
-    && /^\d{4}-\d{2}-\d{2}$/.test(t.date)
+    && validDate(t.date)
     && (t.type === 'income' || t.type === 'expense')
-    && Number.isInteger(t.amount) && t.amount > 0
+    && Number.isSafeInteger(t.amount) && t.amount > 0 && t.amount <= 99999999999
     && typeof t.category === 'string';
 }
 function clean(t) {
   return {
-    id: typeof t.id === 'string' && t.id ? t.id : uid(),
-    ts: Number.isFinite(t.ts) ? t.ts : Date.now(),
+    ts: Number.isFinite(t.ts) ? t.ts : 0,   // 백업 파일 속 입력 순서(있으면)
     date: t.date, type: t.type, amount: t.amount,
     category: t.category.slice(0, 20) || '기타',
     memo: typeof t.memo === 'string' ? t.memo.slice(0, 80) : '',
   };
 }
-function load() {
-  try {
-    const raw = localStorage.getItem(KEY);
-    const data = raw ? JSON.parse(raw) : [];
-    return Array.isArray(data) ? data.filter(isValid).map(clean) : [];
-  } catch { storageOk = false; return []; }
+const byTs = (a, b) => a.ts - b.ts;
+
+/* 이미 있는 내역과 똑같은 것은 건너뜀 → 같은 백업을 여러 번 불러와도 중복되지 않음 */
+async function importRows(list) {
+  const key = (t) => `${t.date}|${t.type}|${t.category}|${t.amount}|${t.memo}`;
+  const seen = new Map();
+  for (const t of await fetchAll(() => db().select(COLS).order('date').order('seq'))) seen.set(key(t), (seen.get(key(t)) || 0) + 1);
+  const fresh = [];
+  for (const t of list) {
+    const left = seen.get(key(t)) || 0;
+    if (left > 0) seen.set(key(t), left - 1); else fresh.push(t);
+  }
+  for (let i = 0; i < fresh.length; i += 500) {
+    const { error } = await db().insert(fresh.slice(i, i + 500).map((t) => ({ ...toRow(t), memo: t.memo })));
+    if (error) throw error;
+  }
+  return fresh.length;
 }
-function save() {
-  try { localStorage.setItem(KEY, JSON.stringify(tx)); }
-  catch { storageOk = false; $('#notice').hidden = false; }
+
+/* 예전 버전이 이 브라우저(localStorage)에 남겨 둔 기록 */
+function legacyRows() {
+  try {
+    const data = JSON.parse(localStorage.getItem(LEGACY_KEY) || '[]');
+    return Array.isArray(data) ? data.filter(isValid).map(clean).sort(byTs) : [];
+  } catch { return []; }
 }
 
 /* ---------- 상태 ---------- */
-let tx = load();
 const now = new Date();
+let tx = [];                                // 지금 보는 달과 지난달의 내역
+let meta = { total: 0, samples: 0 };          // 전체 건수, 샘플 건수
 let view = { y: now.getFullYear(), m: now.getMonth() };
 let filter = 'all';
 let query = '';
 let editingId = null;
+let loading = false;
+let failed = false;                           // 마지막 불러오기가 실패했는지
+let reqId = 0;                               // 오래된 응답을 가려내기 위한 번호
+let busy = false;
+let legacyLater = false;
 
 const monthKey = (y, m) => `${y}-${pad(m + 1)}`;
 const monthTx = (y, m) => tx.filter((t) => t.date.startsWith(monthKey(y, m)));
@@ -441,9 +508,20 @@ function render() {
   $('#monthLabel').textContent = `${view.y}년 ${view.m + 1}월`;
   const isCurrent = view.y === now.getFullYear() && view.m === now.getMonth();
   $('#thisMonth').hidden = isCurrent;
+  $('#wipeSample').hidden = !meta.samples;
+  $('#wipeSample').textContent = `샘플 데이터 지우기 (${meta.samples}건)`;
+  if (loading || failed) { renderPlaceholder(loading ? '불러오는 중…' : '내역을 불러오지 못했어요.'); return; }
   renderSummary();
   renderChart();
   renderList();
+}
+
+function renderPlaceholder(msg) {   // 불러오는 중이거나 실패했을 때: 옛 값이 남아 보이지 않게 비워 둠
+  for (const id of ['#sumInc', '#sumExp', '#sumBal']) { $(id).textContent = '–'; $(id).className = 'v'; }
+  for (const id of ['#subInc', '#subExp', '#subBal']) { $(id).textContent = ''; $(id).className = 'sub'; }
+  $('#count').textContent = '';
+  $('#chart').replaceChildren(el('div', { class: 'empty', text: msg }));
+  $('#list').replaceChildren(el('div', { class: 'empty', text: msg }));
 }
 
 function renderSummary() {
@@ -518,11 +596,11 @@ function renderList() {
   const monthly = monthTx(view.y, view.m);
   const items = monthly
     .filter((t) => (filter === 'all' || t.type === filter) && (!q || `${t.memo} ${t.category}`.toLowerCase().includes(q)))
-    .sort((a, b) => b.date.localeCompare(a.date) || b.ts - a.ts);
+    .sort((a, b) => b.date.localeCompare(a.date) || b.seq - a.seq);
   $('#count').textContent = items.length ? `${items.length}건` : '';
 
   if (!items.length) {
-    if (!tx.length) {
+    if (!meta.total) {
       box.append(el('div', { class: 'empty' },
         el('div', { text: '아직 기록이 없어요. 왼쪽에서 첫 내역을 추가해 보세요.' }),
         el('div', {}, el('button', { class: 'link-btn', type: 'button', text: '샘플 데이터로 먼저 체험하기', onclick: addSamples }))));
@@ -578,32 +656,45 @@ amountEl.addEventListener('input', () => {
   errEl.textContent = '';
 });
 
-form.addEventListener('submit', (e) => {
+/* 서버에 쓰는 일은 한 번에 하나씩만 (연타로 중복 저장되는 것 방지). 실패하면 안내 문구를 띄움 */
+async function run(task, failMsg) {
+  if (busy) return false;
+  busy = true;
+  $('#submitBtn').disabled = true;
+  try { await task(); return true; }
+  catch (err) { console.error(err); toast(denied(err) ? DENIED : failMsg); return false; }
+  finally { busy = false; $('#submitBtn').disabled = false; }
+}
+const NET_FAIL = '인터넷 연결을 확인하고 다시 시도해 주세요.';
+
+form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const amount = Number(amountEl.value.replace(/\D/g, ''));
   if (!amount) { errEl.textContent = '금액을 입력해 주세요.'; amountEl.focus(); return; }
   errEl.textContent = '';
 
   const old = editingId && tx.find((t) => t.id === editingId);
-  const item = {
-    id: old ? old.id : uid(),
-    ts: old ? old.ts : Date.now(),
-    date: dateEl.value,
-    type: currentType(),
-    category: currentCat(),
-    amount,
-    memo: old ? old.memo : '',
-  };
-  if (old) Object.assign(old, item); else tx.push(item);
-  save();
+  const row = toRow({ date: dateEl.value, type: currentType(), category: currentCat(), amount });
+  let gone = false;
+  const ok = await run(async () => {
+    if (old) {
+      const { data, error } = await db().update(row).eq('id', old.id).select('id');
+      if (error) throw error;
+      gone = !data.length;   // 다른 기기에서 이미 지운 내역
+    } else {
+      const { error } = await db().insert(row);
+      if (error) throw error;
+    }
+  }, `저장하지 못했어요. ${NET_FAIL}`);
+  if (!ok) return;
+  if (gone) toast('이미 삭제된 내역이라 수정하지 못했어요.');
 
-  const [y, m] = item.date.split('-').map(Number);
+  const [y, m] = row.date.split('-').map(Number);
   view = { y, m: m - 1 };
-  const wasEditing = !!old;
   stopEditing();
   amountEl.value = '';
-  render();
-  if (!wasEditing) amountEl.focus();
+  await refresh();
+  if (!old) amountEl.focus();
 });
 
 function startEdit(id) {
@@ -640,14 +731,25 @@ $('#cancelEdit').addEventListener('click', () => {
   renderList();
 });
 
-function remove(id) {
-  const i = tx.findIndex((t) => t.id === id);
-  if (i < 0) return;
-  const [item] = tx.splice(i, 1);
+async function remove(id) {
+  const item = tx.find((t) => t.id === id);
+  if (!item) return;
+  const ok = await run(async () => {
+    const { error } = await db().delete().eq('id', id);
+    if (error) throw error;
+  }, `삭제하지 못했어요. ${NET_FAIL}`);
+  if (!ok) return;
   if (editingId === id) { stopEditing(); amountEl.value = ''; }
-  save();
-  render();
-  toast('내역을 삭제했어요.', '실행 취소', () => { tx.push(item); save(); render(); });
+  toast('내역을 삭제했어요.', '실행 취소', () => undo(item));
+  await refresh();
+}
+
+async function undo(item) {
+  const ok = await run(async () => {
+    const { error } = await db().insert({ id: item.id, seq: item.seq, ...toRow(item), memo: item.memo, sample: item.sample });   // seq도 그대로 넣어서 원래 순서 복원
+    if (error) throw error;
+  }, `되돌리지 못했어요. ${NET_FAIL}`);
+  if (ok) await refresh();
 }
 
 /* ---------- 목록 필터·월 이동 ---------- */
@@ -655,14 +757,53 @@ document.querySelectorAll('input[name=filter]').forEach((r) =>
   r.addEventListener('change', () => { filter = r.value; renderList(); }));
 $('#search').addEventListener('input', (e) => { query = e.target.value; renderList(); });
 
+/* ---------- 서버에서 불러오기 ---------- */
+function showNotice(msg, retry) {
+  $('#noticeMsg').textContent = msg;
+  $('#noticeRetry').hidden = !retry;
+  $('#noticeRetry').onclick = retry;
+  $('#notice').hidden = false;
+}
+const hideNotice = () => { $('#notice').hidden = true; };
+
+// 보고 있는 달과 지난달(지난달 대비 계산용)을 받아옴. withMeta: 전체·샘플 건수도 같이 갱신
+async function refresh({ withMeta = true } = {}) {
+  const my = ++reqId;
+  const first = iso(new Date(view.y, view.m - 1, 1));
+  const end = iso(new Date(view.y, view.m + 1, 1));
+  try {
+    const [rows, counts] = await Promise.all([
+      fetchAll(() => db().select(COLS).gte('date', first).lt('date', end).order('date', { ascending: false }).order('seq', { ascending: false })),
+      withMeta ? Promise.all([count(), count((q) => q.eq('sample', true))]) : null,
+    ]);
+    if (my !== reqId) return;   // 그 사이 달을 옮기거나 새로 불러옴 → 오래된 응답은 버림
+    tx = rows;
+    if (counts) meta = { total: counts[0], samples: counts[1] };
+    failed = false;
+    hideNotice();
+  } catch (err) {
+    if (my !== reqId) return;
+    console.error(err);
+    failed = true;
+    showNotice(denied(err) ? DENIED : '서버에서 내역을 불러오지 못했어요. 인터넷 연결을 확인해 주세요.', () => { loading = true; render(); refresh(); });
+  }
+  loading = false;
+  render();
+}
+
+function goTo(y, m) {
+  view = { y, m };
+  loading = true;
+  render();
+  refresh({ withMeta: false });
+}
 function shiftMonth(delta) {
   const d = new Date(view.y, view.m + delta, 1);
-  view = { y: d.getFullYear(), m: d.getMonth() };
-  render();
+  goTo(d.getFullYear(), d.getMonth());
 }
 $('#prev').addEventListener('click', () => shiftMonth(-1));
 $('#next').addEventListener('click', () => shiftMonth(1));
-$('#thisMonth').addEventListener('click', () => { view = { y: now.getFullYear(), m: now.getMonth() }; render(); });
+$('#thisMonth').addEventListener('click', () => goTo(now.getFullYear(), now.getMonth()));
 
 /* ---------- 토스트 ---------- */
 let toastTimer;
@@ -687,18 +828,28 @@ function download(name, text, mime) {
 }
 const csvCell = (v) => { const s = String(v); return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
 
-$('#exportCsv').addEventListener('click', () => {
-  if (!tx.length) { toast('내보낼 내역이 없어요.'); return; }
-  const sorted = [...tx].sort((a, b) => a.date.localeCompare(b.date) || a.ts - b.ts);
-  const withMemo = sorted.some((t) => t.memo);   // 예전 메모가 남아 있을 때만 메모 열을 넣음
+// 내보내기는 화면에 올라와 있는 달만이 아니라 전체 내역이 대상 (오래된 순)
+async function fetchEverything() {
+  try { return await fetchAll(() => db().select(COLS).order('date').order('seq')); }
+  catch (err) { console.error(err); toast(`내역을 불러오지 못했어요. ${NET_FAIL}`); return null; }
+}
+
+$('#exportCsv').addEventListener('click', async () => {
+  const rows = await fetchEverything();
+  if (!rows) return;
+  if (!rows.length) { toast('내보낼 내역이 없어요.'); return; }
+  const withMemo = rows.some((t) => t.memo);   // 예전 메모가 남아 있을 때만 메모 열을 넣음
   const lines = [['날짜', '구분', '분류', '금액', ...(withMemo ? ['메모'] : [])].join(',')]
-    .concat(sorted.map((t) => [t.date, t.type === 'income' ? '수입' : '지출', t.category, t.amount, ...(withMemo ? [t.memo] : [])].map(csvCell).join(',')));
+    .concat(rows.map((t) => [t.date, t.type === 'income' ? '수입' : '지출', t.category, t.amount, ...(withMemo ? [t.memo] : [])].map(csvCell).join(',')));
   download(`가계부_${iso(new Date())}.csv`, '﻿' + lines.join('\r\n'), 'text/csv;charset=utf-8');
 });
 
-$('#exportJson').addEventListener('click', () => {
-  if (!tx.length) { toast('백업할 내역이 없어요.'); return; }
-  download(`gagyebu-backup-${iso(new Date())}.json`, JSON.stringify(tx, null, 2), 'application/json');
+$('#exportJson').addEventListener('click', async () => {
+  const rows = await fetchEverything();
+  if (!rows) return;
+  if (!rows.length) { toast('백업할 내역이 없어요.'); return; }
+  const out = rows.map(({ id, date, type, category, amount, memo }) => ({ id, date, type, category, amount, memo }));
+  download(`gagyebu-backup-${iso(new Date())}.json`, JSON.stringify(out, null, 2), 'application/json');
 });
 
 $('#importJson').addEventListener('click', () => $('#file').click());
@@ -706,31 +857,58 @@ $('#file').addEventListener('change', async (e) => {
   const f = e.target.files[0];
   e.target.value = '';
   if (!f) return;
+  let list;
   try {
     const data = JSON.parse(await f.text());
     if (!Array.isArray(data)) throw new Error('not array');
-    const ids = new Set(tx.map((t) => t.id));
-    const added = data.filter(isValid).map(clean).filter((t) => !ids.has(t.id));
-    tx.push(...added);
-    save();
-    render();
-    toast(`${added.length}건을 불러왔어요.`);
+    list = data.filter(isValid).map(clean).sort(byTs);
   } catch {
     toast('불러올 수 없는 파일이에요. 이 가계부에서 저장한 JSON 백업 파일인지 확인해 주세요.');
+    return;
   }
+  let added = 0;
+  const ok = await run(async () => { added = await importRows(list); }, `불러오지 못했어요. ${NET_FAIL}`);
+  if (!ok) return;
+  await refresh();
+  toast(`${added}건을 불러왔어요.`);
 });
 
-$('#wipe').addEventListener('click', () => {
-  if (!tx.length) { toast('삭제할 내역이 없어요.'); return; }
-  if (!confirm(`저장된 내역 ${tx.length}건을 모두 삭제할까요? 되돌릴 수 없어요.`)) return;
-  tx = [];
+$('#wipe').addEventListener('click', async () => {
+  let total;
+  try { total = await count(); } catch (err) { console.error(err); toast(`서버에 연결하지 못했어요. ${NET_FAIL}`); return; }
+  if (!total) { toast('삭제할 내역이 없어요.'); return; }
+  if (!confirm(`저장된 내역 ${total}건을 모두 삭제할까요? 되돌릴 수 없어요.`)) return;
+  const ok = await run(async () => {
+    const { error } = await db().delete().not('id', 'is', null);
+    if (error) throw error;
+  }, `삭제하지 못했어요. ${NET_FAIL}`);
+  if (!ok) return;
   stopEditing();
-  save();
-  render();
+  amountEl.value = '';
+  await refresh();
+});
+
+/* ---------- 예전 기록(이 브라우저에 저장돼 있던 것) 옮기기 ---------- */
+function checkLegacy() {
+  const n = legacyRows().length;
+  $('#legacyN').textContent = n;
+  $('#legacy').hidden = !n || legacyLater;
+}
+$('#legacyLater').addEventListener('click', () => { legacyLater = true; checkLegacy(); });
+$('#legacyMove').addEventListener('click', async () => {
+  let moved = 0;
+  const ok = await run(async () => {
+    moved = await importRows(legacyRows());
+    try { localStorage.removeItem(LEGACY_KEY); } catch { /* 서버에는 이미 올라갔으니 무시 */ }   // 서버에 올라간 걸 확인한 뒤에만 지움
+  }, `옮기지 못했어요. 예전 기록은 그대로 남아 있으니 ${NET_FAIL}`);
+  if (!ok) return;
+  checkLegacy();
+  await refresh();
+  toast(`${moved}건을 서버로 옮겼어요.`);
 });
 
 /* ---------- 샘플 ---------- */
-function addSamples() {
+async function addSamples() {
   const y = now.getFullYear(), m = now.getMonth(), today = now.getDate();
   const pd = new Date(y, m - 1, 1);
   const prevLast = new Date(y, m, 0).getDate();
@@ -751,19 +929,41 @@ function addSamples() {
     [22, 'expense', '경조사', 100000], [27, 'expense', '문화·여가', 33000],
   ].map((r) => [pd.getFullYear(), pd.getMonth(), Math.min(r[0], prevLast), ...r.slice(1)]);
 
-  let n = 0;
-  for (const [yy, mm, dd, type, category, amount] of [...prev, ...cur]) {
-    tx.push({ id: uid(), ts: Date.now() + n++, date: `${yy}-${pad(mm + 1)}-${pad(dd)}`, type, category, amount, memo: '' });
-  }
-  save();
-  render();
+  // 샘플은 sample=true 로 표시해 두어서, 나중에 실제 기록과 섞이지 않게 따로 지울 수 있음
+  const rows = [...prev, ...cur].map(([yy, mm, dd, type, category, amount]) =>
+    ({ ...toRow({ date: `${yy}-${pad(mm + 1)}-${pad(dd)}`, type, category, amount }), sample: true }));
+  const ok = await run(async () => {
+    const { error } = await db().insert(rows);
+    if (error) throw error;
+  }, `샘플을 넣지 못했어요. ${NET_FAIL}`);
+  if (!ok) return;
+  await refresh();
+  toast('샘플 데이터를 넣었어요.', '지우기', removeSamples);
 }
+
+async function removeSamples() {
+  const ok = await run(async () => {
+    const { error } = await db().delete().eq('sample', true);
+    if (error) throw error;
+  }, `지우지 못했어요. ${NET_FAIL}`);
+  if (!ok) return;
+  await refresh();
+  toast('샘플 데이터를 지웠어요.');
+}
+$('#wipeSample').addEventListener('click', removeSamples);
 
 /* ---------- 시작 ---------- */
 dateEl.value = iso(now);
 fillCats('expense');
-if (!storageOk) $('#notice').hidden = false;
-render();
+if (!sb) {
+  $('#main').hidden = true;
+  showNotice('서버와 연결하는 데 필요한 파일을 불러오지 못했어요. 인터넷 연결을 확인하고 새로고침해 주세요.', () => location.reload());
+} else {
+  loading = true;
+  render();
+  checkLegacy();
+  refresh();
+}
 })();
 </script>
 </body>
